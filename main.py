@@ -7,7 +7,7 @@ import numpy as np
 import logging as log
 
 from config import appconf as conf
-from utils import getVideoCaptore, getVideoWriter, loadTemplate, printImg
+from utils import getVideoCaptore, getVideoWriter, loadTemplate
 
 
 ROI_ALPHA = 0.5 # Коэффициент расширения ROI
@@ -19,23 +19,28 @@ class Bbox:
     def __init__(self):
         self.isInitialized = False
 
-    def initialize(self, dimensions):
-        self.xObj, self.yObj, self.wObj, self.hObj = dimensions
+    def initialize(self, topLeft, templateShape):
+        """ Инициализация рамки по заданным координатам и размерам. """
+
+        self.xObj, self.yObj = topLeft
+        self.wObj, self.hObj = templateShape[1], templateShape[0]
         self.xRoi, self.yRoi, self.wRoi, self.hRoi = (
-            int(self.xObj - ROI_ALPHA*self.wObj), int(self.yObj - ROI_ALPHA*self.hObj),
-            int(self.wObj + 2*ROI_ALPHA*self.wObj), int(self.hObj + 2*ROI_ALPHA*self.hObj)
+            int(self.xObj - ROI_ALPHA*self.wObj), int(self.yObj - ROI_ALPHA * self.hObj),
+            int(self.wObj + 2 * ROI_ALPHA * self.wObj), int(self.hObj + 2 * ROI_ALPHA * self.hObj)
         )
-        self.center = (self.xObj + self.wObj//2, self.yObj + self.hObj//2)
+        self.center = (self.xObj + self.wObj // 2, self.yObj + self.hObj // 2)
         self.isInitialized = True
     
     def update(self, newTopLeft, templateShape):
+        """ Обновление координат и размеров рамки по новым данным. """
+
         self.wObj, self.hObj = templateShape[1], templateShape[0]
         self.xObj, self.yObj = newTopLeft
         self.xRoi, self.yRoi, self.wRoi, self.hRoi = (
-            int(self.xObj - ROI_ALPHA*self.wObj), int(self.yObj - ROI_ALPHA*self.hObj),
-            int(self.wObj + 2*ROI_ALPHA*self.wObj), int(self.hObj + 2*ROI_ALPHA*self.hObj)
+            int(self.xObj - ROI_ALPHA * self.wObj), int(self.yObj - ROI_ALPHA * self.hObj),
+            int(self.wObj + 2 * ROI_ALPHA * self.wObj), int(self.hObj + 2 * ROI_ALPHA * self.hObj)
         )
-        self.center = (self.xObj + self.wObj//2, self.yObj + self.hObj//2)
+        self.center = (self.xObj + self.wObj // 2, self.yObj + self.hObj // 2)
 
     def objAsTuple(self):
         return (self.xObj, self.yObj, self.wObj, self.hObj)
@@ -85,55 +90,69 @@ def getAdditionalTMConfidenceMetrics(map, roiW, roiH):
 def multiscaleTMPyramid(roi, template):
     """ Поиск шаблона на изображении по сетке масштабов и выбор наиболее уверенного. """
 
+    # Формируем сетку масштабов для последовательного поиска
+    # наиболее подходящего размера шаблона с учетом изменения расстояния до объекта
     mid = (1 + conf["PYRAMID_TM_SETTINGS"]["numScales"]) // 2
-    scales = np.linspace(1 - conf["PYRAMID_TM_SETTINGS"]["scaleStep"]*(mid - 1),
-                1 + conf["PYRAMID_TM_SETTINGS"]["scaleStep"]*(mid - 1),
-                conf["PYRAMID_TM_SETTINGS"]["numScales"])
+    scales = np.linspace(
+        1 - conf["PYRAMID_TM_SETTINGS"]["scaleStep"] * (mid - 1),
+        1 + conf["PYRAMID_TM_SETTINGS"]["scaleStep"] * (mid - 1),
+        conf["PYRAMID_TM_SETTINGS"]["numScales"]
+    )
     
     scaledTplt = None
     bestMatchMap, bestVal, bestScale = None, -1.0, 1.0
-    for s in scales:
-        if np.round(s) == 1: # Никак не масштабируем
+
+    # Для каждого масштаба строим карту совпадений и выбираем наиболее уверенное.
+    # Меняем значения переменных bestMatchMap, bestVal, bestScale только если
+    # найдено более уверенное совпадение чем на предыдущих итерациях.
+    for scale in scales:
+        if np.abs(scale - 1.0) < conf["PYRAMID_TM_SETTINGS"]["epsilon"]: # Никак не масштабируем
             scaledTplt = template
-        elif s < 1.0: # Уменьшаем масштаб используя интерполяцию AREA
-            scaledTplt = cv.resize(template, (0, 0), fx=s, fy=s, interpolation=cv.INTER_AREA)
+        elif scale < 1.0: # Уменьшаем масштаб используя интерполяцию AREA
+            scaledTplt = cv.resize(template, (0, 0), fx=scale, fy=scale, interpolation=cv.INTER_AREA)
         else: # Увеличиваем масштаб используя интерполяцию LINEAR
-            scaledTplt = cv.resize(template, (0, 0), fx=s, fy=s, interpolation=cv.INTER_LINEAR)
+            scaledTplt = cv.resize(template, (0, 0), fx=scale, fy=scale, interpolation=cv.INTER_LINEAR)
 
         
         map = cv.matchTemplate(roi, scaledTplt, cv.TM_CCOEFF_NORMED)
-        maxVal = np.max(map)
-        if maxVal > bestVal:
+        maximum = np.max(map)
+
+        if maximum > bestVal:
             bestMatchMap = map
-            bestVal = maxVal
-            bestScale = s
-    
+            bestVal = maximum
+            bestScale = scale
+
     log.debug(f"Лучший масштаб: {bestScale:.3f}, уверенность: {bestVal:.3f}")
     return bestMatchMap, bestScale if bestScale != 1.0 else None
 
 
-def findTemplate(img, template, bbox, frame):
+def findTemplate(img, template, bbox: Bbox, frame):
     """ Поиск шаблона на изображении. """
     
+    # Инициализация рамки при первом вызове
+    # Шаблон ищется по всему кадру
     if not bbox.isInitialized:
-
-        res = cv.matchTemplate(img, template, cv.TM_CCOEFF_NORMED)
-        minVal, maxVal, minLoc, maxLoc = cv.minMaxLoc(res)
-        bbox.initialize((maxLoc[0], maxLoc[1], template.shape[1], template.shape[0]))
+        map = cv.matchTemplate(img, template, cv.TM_CCOEFF_NORMED)
+        _, _, _, maxLoc = cv.minMaxLoc(map)
+        bbox.initialize(maxLoc, template.shape)
         log.info(f"Инициализация рамки: {bbox.objAsTuple()}")
-        return True, bbox, template
+        return True, template, bbox
 
-    # Вырезаем ROI из кадра
+    # Вырезаем ROI из кадра, в котором будет производиться поиск
+    # Проверка на выход за границы изображения и корректировка
     xRoi, yRoi, wRoi, hRoi = bbox.roiAsTuple()
-    roi = img[max(0, yRoi):min(img.shape[0], yRoi + hRoi), max(0, xRoi):min(img.shape[1], xRoi + wRoi)]
+    x0 = max(0, xRoi); y0 = max(0, yRoi)
+    x1 = min(img.shape[1], xRoi + wRoi); y1 = min(img.shape[0], yRoi + hRoi)
+    roi = img[y0:y1, x0:x1]
 
     # Поиск по сетке масштабов, если confidence меньше порога
     scale = None
     grayMap = cv.matchTemplate(roi, template, cv.TM_CCOEFF_NORMED)
     _, maxVal, _, maxLoc = cv.minMaxLoc(grayMap)
     
-    if maxVal < np.float32(0.89):
-        log.debug(f"TM confidence {maxVal:.3f} меньше порога {0.9}, поиск по сетке масштабов...")
+    minConf = conf["MIN_CONF"]
+    if maxVal < minConf:
+        log.debug(f"TM confidence {maxVal:.3f} меньше порога {minConf}, поиск по сетке масштабов...")
         grayMap, scale = multiscaleTMPyramid(roi, template)
     
 
@@ -142,14 +161,16 @@ def findTemplate(img, template, bbox, frame):
             interpolation=cv.INTER_AREA if scale < 1.0 else cv.INTER_LINEAR)
 
     # Данные по лучшему совпадению и дополнительные метрики его качества
-    maxLoc, conf, PSR, APCE = getAdditionalTMConfidenceMetrics(grayMap, template.shape[1], template.shape[0])
-    log.debug(f"TM confidence: {conf:.3f}, PSR: {PSR:.3f}, APCE: {APCE:.3f} at frame: {frame}")
+    maxLoc, confidence, PSR, APCE = getAdditionalTMConfidenceMetrics(grayMap, template.shape[1], template.shape[0])
+    log.debug(f"TM confidence: {confidence:.3f}, PSR: {PSR:.3f}, APCE: {APCE:.3f} at frame: {frame}")
 
-    if conf > 0.9 and PSR > 2.0 and APCE > 1.0:
-        bbox.update((maxLoc[0] + xRoi, maxLoc[1] + yRoi), template.shape)
-        return True, bbox, template
+    if confidence > 0.8:
+        bbox.update((maxLoc[0] + x0, maxLoc[1] + y0), template.shape)
+        return True, template, bbox
+    else:
+        """ TODO: Логика обработки случая когда объект не найден. Пока не знаю что делать."""
 
-    return False, bbox, template
+    return False, template, bbox
 
 
 
@@ -157,18 +178,19 @@ def findTemplate(img, template, bbox, frame):
 
 def runMainLoop(cap: cv.VideoCapture, out: cv.VideoWriter):
     """ Основной цикл обработки видео. """
-    
+    start = tm.time()
+
     # Загрузка фиксированного шаблона
     # (Сценарий: захват в определенный момент времени объекта оператором)
     fixedTemplt = loadTemplate(os.path.join(
         conf["DATA_FOLDER"], conf["TEMPLATE_NAME"]))
     
-    # Адаптивный текущий шаблон
+    # Адаптивный шаблон текущей итерации обработки
     adaptiveTemplt = fixedTemplt.copy()
 
     frames = 0 # Счетчик обработанных кадров
     _, curFrame = cap.read()
-    hFrm, wFrm = int(cap.get(cv.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv.CAP_PROP_FRAME_HEIGHT))
+    frmH, frmW = curFrame.shape[0], curFrame.shape[1]
 
     bbox = Bbox() # Объект ограничивающей шаблон рамки
 
@@ -186,40 +208,55 @@ def runMainLoop(cap: cv.VideoCapture, out: cv.VideoWriter):
         curGrayFrame = preprocessing(curFrame, claheResult=True, blurrResult=False)
 
         # Поиск шаблона на текущем кадре
-        wasFounded, bbox, adaptiveTemplt = findTemplate(curGrayFrame, adaptiveTemplt, bbox, frames)
+        wasFounded, adaptiveTemplt, bbox = findTemplate(curGrayFrame, adaptiveTemplt, bbox, frames)
 
         # Отрисовка результатов
         if wasFounded:
+
             # Рисуем рамку вокруг объекта
-            cv.rectangle(curFrame, (bbox.xObj, bbox.yObj), (bbox.xObj + bbox.wObj, bbox.yObj + bbox.hObj), (0, 255, 0), 2)
+            cv.rectangle(curFrame,
+                (bbox.xObj, bbox.yObj),
+                (bbox.xObj + bbox.wObj, bbox.yObj + bbox.hObj),
+                (0, 255, 0), 2
+            )
+            
             # Рисуем рамку вокруг ROI
-            cv.rectangle(curFrame, (max(0, bbox.xRoi), max(0, bbox.yRoi)),
-                (min(wFrm, bbox.xRoi + bbox.wRoi), min(hFrm, bbox.yRoi + bbox.hRoi)), (255, 0, 0), 2)
-            # Добавляем текст с координатами центра объекта и ROI
-            cv.putText(curFrame, f"Center: {bbox.center}", (10, 30), cv.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-            cv.putText(curFrame, f"ROI: {(max(0, bbox.xRoi), max(0, bbox.yRoi), min(wFrm, bbox.xRoi + bbox.wRoi), min(hFrm, bbox.yRoi + bbox.hRoi))}", (10, 60), cv.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
+            cv.rectangle(curFrame,
+                (max(0, bbox.xRoi), max(0, bbox.yRoi)),
+                (min(frmW, bbox.xRoi + bbox.wRoi), min(frmH, bbox.yRoi + bbox.hRoi)),
+                (255, 0, 0), 2
+            )
+            
+            # Добавляем текст с координатами центра объекта, размеров самого объекта и ROI
+            cv.putText(curFrame, f"Center: {bbox.center}", (10, 30),
+                cv.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            cv.putText(curFrame, f"OBJ: {(max(0, bbox.xObj), max(0, bbox.yObj), bbox.wObj, bbox.hObj)}",
+                (10, 60), cv.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
+            cv.putText(curFrame, f"ROI: {(max(0, bbox.xRoi), max(0, bbox.yRoi), bbox.wRoi, bbox.hRoi)}",
+                (10, 90), cv.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
+
         else:
             log.info("Объект не найден на кадре.")
 
         cv.imshow('Video Playback', curFrame)
-        # tm.sleep(0.1)
+        out.write(curFrame)
+
         curFrame = nxtFrame
+        frames += 1
 
         if frames % 100 == 0:
             log.info(f"Количество обработанных кадров: {frames}")
         
-        out.write(curFrame)
-        frames += 1
-
         # Выход по нажатию клавиши 'q'
         if cv.waitKey(1) & 0xFF == ord('q'):
             break
 
     log.info("Основной цикл обработки видео завершился. Количество обработанных кадров: " + str(frames))
-
+    log.info(f"Обработка в среднем {frames / (tm.time() - start)} FPS")
 
 def main():
 
+    # Настройка логгирования
     log.basicConfig(
         level=log.DEBUG,
         format="[%(levelname)s] %(name)s: %(message)s",
@@ -235,11 +272,12 @@ def main():
         conf["VIDEO_FOLDER"] = os.path.join(basedir, conf["VIDEO_FOLDER"])
         log.info("\n" + basedir + "\n" + conf["VIDEO_FOLDER"])
 
-        # Объект из которого читаются кадры
+        # Создание объекта из которого читаются кадры
         cap = getVideoCaptore(os.path.join(conf["VIDEO_FOLDER"], conf["VIDEO_NAME"]))
-        # Объект, создающий результирующую видеодорожку
+
+        # Создание объекта, записывающего результирующую видеодорожку
         out = getVideoWriter("output.mp4", os.path.join(conf["DATA_FOLDER"], conf["OUT_VIDEO_FOLDER"]),
-            15.0, int(cap.get(cv.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv.CAP_PROP_FRAME_HEIGHT)))
+            float(cap.get(cv.CAP_PROP_FPS)), int(cap.get(cv.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv.CAP_PROP_FRAME_HEIGHT)))
         
         # Основной цикл тестирования трекера
         runMainLoop(cap, out)
