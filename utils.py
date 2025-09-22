@@ -12,7 +12,7 @@ def printImg(img, winname, printAsGray = False):
     cv.destroyWindow(winname)
 
 
-def getVideoCaptore(passToVideo: str) -> cv.VideoCapture:
+def getVideoCapture(passToVideo: str) -> cv.VideoCapture:
     if not os.path.exists(passToVideo):
         raise FileNotFoundError(f"Файл {passToVideo} не найден!")
     return cv.VideoCapture(passToVideo)

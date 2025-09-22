@@ -7,16 +7,21 @@ import numpy as np
 import logging as log
 
 from config import appconf as conf
-from utils import getVideoCaptore, getVideoWriter, loadTemplate
+from utils import getVideoCapture, getVideoWriter, loadTemplate
 
 
-ROI_ALPHA = 0.5 # Коэффициент расширения ROI
+ROI_ALPHA = 0.4 # Коэффициент расширения ROI
 
 
 class Bbox:
     """ Класс ограничивающей объект рамки. """
     
     def __init__(self):
+        # Необходимые для calcOpticalFlowPyrLK данные
+        self.minOptFlwPts = 15
+        self.prevGrayFrame = None
+
+        # Флаг инициализации рамки
         self.isInitialized = False
 
     def initialize(self, topLeft, templateShape):
@@ -49,14 +54,13 @@ class Bbox:
         return (self.xRoi, self.yRoi, self.wRoi, self.hRoi)
 
 
-def preprocessing(frame, claheResult = False, blurrResult = False):
+def preprocessing(frame, clahe, claheResult = False, blurrResult = False):
     """ Предобработка кадра: перевод в серый, CLAHE, блюр. По умолчанию
     CLAHE и блюр не применяются. """
     
     curGrayFrame = cv.cvtColor(frame, cv.COLOR_BGR2GRAY)
     
     if claheResult:
-        clahe = cv.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
         curGrayFrame = clahe.apply(curGrayFrame)
 
     if blurrResult:
@@ -65,7 +69,7 @@ def preprocessing(frame, claheResult = False, blurrResult = False):
     return curGrayFrame
 
 
-def getAdditionalTMConfidenceMetrics(map, roiW, roiH):
+def getAdditionalTMConfidenceMetrics(map):
     """ Дополнительные метрики качества найденного шаблона. """
     
     mapH, mapW = map.shape
@@ -92,10 +96,9 @@ def multiscaleTMPyramid(roi, template):
 
     # Формируем сетку масштабов для последовательного поиска
     # наиболее подходящего размера шаблона с учетом изменения расстояния до объекта
-    mid = (1 + conf["PYRAMID_TM_SETTINGS"]["numScales"]) // 2
     scales = np.linspace(
-        1 - conf["PYRAMID_TM_SETTINGS"]["scaleStep"] * (mid - 1),
-        1 + conf["PYRAMID_TM_SETTINGS"]["scaleStep"] * (mid - 1),
+        1,
+        1 + conf["PYRAMID_TM_SETTINGS"]["scaleStep"] * (conf["PYRAMID_TM_SETTINGS"]["numScales"] - 1),
         conf["PYRAMID_TM_SETTINGS"]["numScales"]
     )
     
@@ -126,6 +129,52 @@ def multiscaleTMPyramid(roi, template):
     return bestMatchMap, bestScale if bestScale != 1.0 else None
 
 
+def findTransformation(curFrame, bbox: Bbox):
+    """ Ищет такое преобразование подобия, которое бы позволило
+    совместить текущий template с деформированным на кадре. """
+
+    # Перевод следующего за очередным кадра в полутновое
+    curGrayFrame = curFrame if len(curFrame.shape) == 2 else cv.cvtColor(curFrame, cv.COLOR_BGR2GRAY)
+
+    # Работаем только внутри рамки шаблона
+    # TODO: Подумать использовать ли ROI вместо obj для большего охвата?
+    x, y, w, h = bbox.objAsTuple()
+    mask = np.zeros_like(bbox.prevGrayFrame, dtype=np.uint8)
+    mask[y:y+h, x:x+w] = 255
+
+    # Поиск ключевых точек изображения на предыдущем кадре
+    prevPts = cv.goodFeaturesToTrack(bbox.prevGrayFrame,
+        mask=mask, **conf["FIND_TRANSFORMATION"]["gf2tParams"])
+    
+    if prevPts is None or len(prevPts) < bbox.minOptFlwPts:
+        return None, None
+
+    # Параметры для метода cv.calcOpticalFlowPyrLK в config.py
+    ptsCurFrame, stateFwd, errFwd = cv.calcOpticalFlowPyrLK(bbox.prevGrayFrame, curGrayFrame,
+        prevPts, None, **conf["FIND_TRANSFORMATION"]["lkParams"])
+    ptsPrevFrame, stateBwd, _ = cv.calcOpticalFlowPyrLK(curGrayFrame, bbox.prevGrayFrame,
+        ptsCurFrame, None, **conf["FIND_TRANSFORMATION"]["lkParams"])
+    
+    # Создание фильтра для точек, который исчезли в следующем кадре или являются некачественными
+    distFilter = np.linalg.norm(prevPts.reshape(-1, 2)-ptsPrevFrame.reshape(-1, 2), axis=1)
+    stateFwd = stateFwd.reshape(-1).astype(bool)
+    stateBwd = stateBwd.reshape(-1).astype(bool)
+    errFwd = errFwd.reshape(-1)
+    filteredPtsIdxs = stateFwd & stateBwd & (distFilter < 1.0) & (errFwd < 20.0)
+    
+    # Отфильтрованные точки
+    srcPts = prevPts.reshape(-1,2)[filteredPtsIdxs]
+    dstPts = ptsCurFrame.reshape(-1,2)[filteredPtsIdxs]
+
+    # Вычисление преобразования подобия (similarity transformation)
+    M, inliers = cv.estimateAffinePartial2D(
+        srcPts, dstPts, method=cv.RANSAC, ransacReprojThreshold=3.0,
+        maxIters=2000, confidence=0.99, refineIters=10
+    )
+    
+    return M, inliers
+
+
 def findTemplate(img, template, bbox: Bbox, frame):
     """ Поиск шаблона на изображении. """
     
@@ -145,39 +194,68 @@ def findTemplate(img, template, bbox: Bbox, frame):
     x1 = min(img.shape[1], xRoi + wRoi); y1 = min(img.shape[0], yRoi + hRoi)
     roi = img[y0:y1, x0:x1]
 
-    # Поиск по сетке масштабов, если confidence меньше порога
+    # Изначально считаем, что размер шаблона не изменился и рассчитываем что
+    # не прийдется прибегать к поиску по сетке масштабов
     scale = None
     grayMap = cv.matchTemplate(roi, template, cv.TM_CCOEFF_NORMED)
     _, maxVal, _, maxLoc = cv.minMaxLoc(grayMap)
     
     minConf = conf["MIN_CONF"]
+    # Поиск по сетке масштабов, если все же confidence меньше порога
     if maxVal < minConf:
         log.debug(f"TM confidence {maxVal:.3f} меньше порога {minConf}, поиск по сетке масштабов...")
         grayMap, scale = multiscaleTMPyramid(roi, template)
     
-
     if scale is not None:
         template = cv.resize(template, (0, 0), fx=scale, fy=scale, 
             interpolation=cv.INTER_AREA if scale < 1.0 else cv.INTER_LINEAR)
 
     # Данные по лучшему совпадению и дополнительные метрики его качества
-    maxLoc, confidence, PSR, APCE = getAdditionalTMConfidenceMetrics(grayMap, template.shape[1], template.shape[0])
+    maxLoc, confidence, PSR, APCE = getAdditionalTMConfidenceMetrics(grayMap)
     log.debug(f"TM confidence: {confidence:.3f}, PSR: {PSR:.3f}, APCE: {APCE:.3f} at frame: {frame}")
 
-    if confidence > 0.8:
+    if confidence > minConf:
         bbox.update((maxLoc[0] + x0, maxLoc[1] + y0), template.shape)
-        return True, template, bbox
+        log.debug(f"Объект успешно найден с уверенностью {confidence:.3f} на кадре {frame}.")
+
     else:
-        """ TODO: Логика обработки случая когда объект не найден. Пока не знаю что делать."""
+        """ Логика обработки случая когда объект не найден с помощью TM. """
 
-    return False, template, bbox
+        M, _ = findTransformation(curFrame=img, bbox=bbox)
 
+        if M is not None:
 
+            # Границы рамки шаблона на предыдущем кадре трансформируем в текущий
+            x, y, w, h = bbox.objAsTuple()
+            pts = np.array([[x, y], [x + w, y], [x + w, y + h], [x, y + h]], dtype=np.float32).reshape(-1, 1, 2)
+            transformedPts = cv.transform(pts, M).reshape(-1, 2)
 
+            # Формируем новую ограничивающую рамку по трансформированным углам
+            bbox.update(
+                (int(np.min(transformedPts[:,0])), int(np.min(transformedPts[:,1]))),
+                (int(np.max(transformedPts[:,0]) - np.min(transformedPts[:,0])),
+                int(np.max(transformedPts[:,1]) - np.min(transformedPts[:,1])))
+            )
+
+            # Проверка на выход за границы изображения...
+            
+            # Обновляем шаблон с учетом найденного масштаба
+            x, y, w, h = bbox.objAsTuple()
+            template = img[y:y+h, x:x+w].copy()
+
+            log.debug(f"Similarity найдено, текущий кадр: {frame}.")
+
+        else:
+            bbox.isInitialized = False
+
+            log.warning(f"Объект не найден на кадре {frame}, similarity не найден.")
+    
+    return True, template, bbox
 
 
 def runMainLoop(cap: cv.VideoCapture, out: cv.VideoWriter):
     """ Основной цикл обработки видео. """
+
     start = tm.time()
 
     # Загрузка фиксированного шаблона
@@ -194,6 +272,10 @@ def runMainLoop(cap: cv.VideoCapture, out: cv.VideoWriter):
 
     bbox = Bbox() # Объект ограничивающей шаблон рамки
 
+    # объект CLAHE (Contrast Limited Adaptive Histogram Equalization)
+    # улучшает контрастность изображения в темных и светлых областях
+    clahe = cv.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+
     # Цикл чтения последовательности кадров видео и захвата объекта
     while True:
         
@@ -205,7 +287,7 @@ def runMainLoop(cap: cv.VideoCapture, out: cv.VideoWriter):
             break
 
         # Предобработка, в частности перевод в серый, блюр и CLAHE
-        curGrayFrame = preprocessing(curFrame, claheResult=True, blurrResult=False)
+        curGrayFrame = preprocessing(curFrame, clahe, claheResult=True, blurrResult=False)
 
         # Поиск шаблона на текущем кадре
         wasFounded, adaptiveTemplt, bbox = findTemplate(curGrayFrame, adaptiveTemplt, bbox, frames)
@@ -234,6 +316,9 @@ def runMainLoop(cap: cv.VideoCapture, out: cv.VideoWriter):
                 (10, 60), cv.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
             cv.putText(curFrame, f"ROI: {(max(0, bbox.xRoi), max(0, bbox.yRoi), bbox.wRoi, bbox.hRoi)}",
                 (10, 90), cv.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
+            # Отображаем текущий FPS
+            cv.putText(curFrame, f"FPS: {frames / (tm.time() - start):.2f}", (10, 120),
+                cv.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
 
         else:
             log.info("Объект не найден на кадре.")
@@ -241,6 +326,10 @@ def runMainLoop(cap: cv.VideoCapture, out: cv.VideoWriter):
         cv.imshow('Video Playback', curFrame)
         out.write(curFrame)
 
+        # tm.sleep(0.05) # Для замедления воспроизведения видео
+
+        # Всегда храним старый кадр в bbox.prevGrayFrm
+        bbox.prevGrayFrame = curGrayFrame
         curFrame = nxtFrame
         frames += 1
 
@@ -258,7 +347,7 @@ def main():
 
     # Настройка логгирования
     log.basicConfig(
-        level=log.DEBUG,
+        level=log.INFO,
         format="[%(levelname)s] %(name)s: %(message)s",
         handlers=[
             log.StreamHandler()
@@ -273,7 +362,7 @@ def main():
         log.info("\n" + basedir + "\n" + conf["VIDEO_FOLDER"])
 
         # Создание объекта из которого читаются кадры
-        cap = getVideoCaptore(os.path.join(conf["VIDEO_FOLDER"], conf["VIDEO_NAME"]))
+        cap = getVideoCapture(os.path.join(conf["VIDEO_FOLDER"], conf["VIDEO_NAME"]))
 
         # Создание объекта, записывающего результирующую видеодорожку
         out = getVideoWriter("output.mp4", os.path.join(conf["DATA_FOLDER"], conf["OUT_VIDEO_FOLDER"]),
